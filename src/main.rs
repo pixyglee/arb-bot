@@ -1,18 +1,14 @@
-// sol - usdc
-// 1 sol --> 200 usdc
-// token_a_in ==> token_b_out
-
 use std::{collections::HashMap, sync::Arc};
 mod raydium_clmm;
 mod raydium_math;
-use anyhow::Context;
+
 use futures_util::StreamExt;
+use reqwest;
+use serde::Deserialize;
 use tokio::sync::Mutex;
-use yellowstone_grpc_client::{ClientTlsConfig, GeyserGrpcClient, Interceptor};
+use yellowstone_grpc_client::{ClientTlsConfig, GeyserGrpcClient};
 use yellowstone_grpc_proto::geyser::{
-    SubscribeRequest, SubscribeRequestFilterAccounts, SubscribeRequestFilterAccountsFilter,
-    SubscribeRequestFilterAccountsFilterMemcmp, subscribe_request_filter_accounts_filter::Filter,
-    subscribe_request_filter_accounts_filter_memcmp, subscribe_update::UpdateOneof,
+    SubscribeRequest, SubscribeRequestFilterAccounts, subscribe_update::UpdateOneof,
 };
 
 use crate::{
@@ -22,35 +18,83 @@ use crate::{
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DexStruct {
-    token_in: u64,  // sol
-    token_out: u64, // usdc
+    token_in: u64,          // sol
+    token_out: Option<u64>, // usdc, None until first update
 }
 
+#[derive(Debug)]
 pub struct CexStruct {
     best_bid: u64,
     best_ask: u64,
 }
+
+#[derive(Debug, Deserialize)]
+struct DepthResponse {
+    bids: Vec<(String, String)>,
+    asks: Vec<(String, String)>,
+}
+
+async fn fetch_cex_data(cex_struct: Arc<Mutex<CexStruct>>) -> Result<(), anyhow::Error> {
+    let url = "https://api.backpack.exchange/api/v1/depth?symbol=SOL_USDC";
+    loop {
+        let resp: DepthResponse = reqwest::get(url).await?.json().await?;
+
+        let best_bid = resp.bids.first().unwrap().0.parse::<f64>().unwrap();
+        let best_ask = resp.asks.first().unwrap().0.parse::<f64>().unwrap();
+
+        let mut cex = cex_struct.lock().await;
+        cex.best_bid = (best_bid * 1_000_000.0) as u64;
+        cex.best_ask = (best_ask * 1_000_000.0) as u64;
+
+        println!("CEX updated: {:?}", *cex);
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
+}
+
+async fn handle_arb_txs(dex_struct: Arc<Mutex<DexStruct>>, cex_struct: Arc<Mutex<CexStruct>>) {
+    loop {
+        let dex = dex_struct.lock().await;
+        let token_out = match dex.token_out {
+            Some(val) => val,
+            None => {
+                drop(dex);
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                continue;
+            }
+        };
+
+        let cex = cex_struct.lock().await;
+
+        let spread = token_out as i64 - cex.best_ask as i64;
+        if spread > 0 {
+            println!(
+                "💸 Arb found: Buy on CEX at {} USDC, Sell on DEX for {} USDC (spread: {})",
+                cex.best_ask, token_out, spread
+            );
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
     let dex_struct = Arc::new(Mutex::new(DexStruct {
-        token_in: 0u64,
-        token_out: 0u64,
+        token_in: 0,
+        token_out: None,
     }));
     let cex_struct = Arc::new(Mutex::new(CexStruct {
-        best_bid: 0u64,
-        best_ask: 0u64,
+        best_bid: 0,
+        best_ask: 0,
     }));
 
-    let dex_struct_grpc_clone = dex_struct.clone();
-    let cex_struct_grpc_clone = cex_struct.clone();
+    let dex_clone = dex_struct.clone();
+    let cex_clone = cex_struct.clone();
+    let dex_grpc_clone = dex_struct.clone();
+    let cex_grpc_clone = cex_struct.clone();
 
-    let dex_struct_bp_clone = dex_struct.clone();
-    let cex_struct_bp_clone = cex_struct.clone();
-
-    // streaming grpc
     let j1 = tokio::spawn(async move {
         let tls_config = ClientTlsConfig::new().with_native_roots();
-
         if let Ok(mut client) = GeyserGrpcClient::build_from_shared(
             "https://solana-yellowstone-grpc.publicnode.com:443",
         )
@@ -62,13 +106,11 @@ async fn main() -> Result<(), anyhow::Error> {
         .await
         {
             let mut accounts: HashMap<String, SubscribeRequestFilterAccounts> = HashMap::new();
-
             let filter = SubscribeRequestFilterAccounts {
-                owner: vec![],                                                             // TODO
-                account: vec!["3ucNos4NbumPLZNWztqGHNFFgkHeRMBQAVemeeomsUxv".to_string()], // TODO
+                owner: vec![],
+                account: vec!["3ucNos4NbumPLZNWztqGHNFFgkHeRMBQAVemeeomsUxv".to_string()],
                 ..Default::default()
             };
-
             accounts.insert("client".to_string(), filter);
             let (_tx, mut stream) = client
                 .subscribe_with_request(Some(SubscribeRequest {
@@ -77,20 +119,19 @@ async fn main() -> Result<(), anyhow::Error> {
                 }))
                 .await
                 .expect("Error: unable to make grpc connection request");
-            loop {
-                let message = stream.next().await.unwrap();
 
+            while let Some(message) = stream.next().await {
                 match message {
                     Ok(r) => {
                         if let Some(UpdateOneof::Account(r)) = r.update_oneof {
                             if let Some(account) = r.account {
                                 let pool: PoolState =
                                     bincode::deserialize(&account.data[8..]).unwrap();
-                                let is_base_input = true;
-                                let zero_for_one = true;
                                 let sqrt_price_current = pool.sqrt_price_x64;
                                 let liquidity = pool.liquidity;
-                                let amount_remaining: u64 = 1 * 1_000_000_000;
+                                let amount_remaining: u64 = 1_000_000_000;
+                                let zero_for_one = true;
+                                let is_base_input = true;
 
                                 let sqrt_price_target = get_next_sqrt_price_from_input(
                                     sqrt_price_current,
@@ -109,38 +150,27 @@ async fn main() -> Result<(), anyhow::Error> {
                                     zero_for_one,
                                 );
 
-                                let mut dex_struct = dex_struct_grpc_clone.lock().await;
+                                let mut dex = dex_grpc_clone.lock().await;
                                 let swap = swap.unwrap();
-                                dex_struct.token_in = swap.amount_in;
-                                dex_struct.token_out = swap.amount_out;
-                                print!("swap state {:?}", dex_struct);
+                                dex.token_in = swap.amount_in;
+                                dex.token_out = Some(swap.amount_out);
+                                println!("DEX swap state: {:?}", dex);
                             }
                         }
                     }
-                    Err(e) => {
-                        eprint!("Error: unable to parse message")
-                    }
+                    Err(_) => eprintln!("Error parsing DEX message"),
                 }
             }
-            // Handle the client here
         }
     });
 
-    // streaming backpack api
-    let j2 = tokio::spawn(async move {});
+    let j2 = tokio::spawn(fetch_cex_data(cex_clone));
 
-    // math logic
-    let j3 = tokio::spawn(async move {});
+    let j3 = tokio::spawn(handle_arb_txs(dex_clone, cex_grpc_clone));
 
-    j1.await;
-    Ok(())
-}
-
-pub fn handle_arb_txs(
-    dex_struct: Arc<Mutex<DexStruct>>,
-    cex_struct: Arc<Mutex<CexStruct>>,
-) -> Result<(), anyhow::Error> {
-    // tokio::task(async move {});
+    j1.await?;
+    j2.await?;
+    j3.await?;
 
     Ok(())
 }
