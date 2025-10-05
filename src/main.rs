@@ -33,7 +33,7 @@ struct DepthResponse {
     bids: Vec<(String, String)>,
     asks: Vec<(String, String)>,
 }
-
+// ------------------- CEX fetch -------------------
 async fn fetch_cex_data(cex_struct: Arc<Mutex<CexStruct>>) -> Result<(), anyhow::Error> {
     let url = "https://api.backpack.exchange/api/v1/depth?symbol=SOL_USDC";
     loop {
@@ -50,10 +50,12 @@ async fn fetch_cex_data(cex_struct: Arc<Mutex<CexStruct>>) -> Result<(), anyhow:
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
     }
 }
-
+// ------------------- Arb logic -------------------
 async fn handle_arb_txs(dex_struct: Arc<Mutex<DexStruct>>, cex_struct: Arc<Mutex<CexStruct>>) {
     loop {
         let dex = dex_struct.lock().await;
+
+        // Wait until DEX has a valid token_out value
         let token_out = match dex.token_out {
             Some(val) => val,
             None => {
@@ -63,9 +65,12 @@ async fn handle_arb_txs(dex_struct: Arc<Mutex<DexStruct>>, cex_struct: Arc<Mutex
             }
         };
 
+        // Lock CEX to read best_bid / best_ask
         let cex = cex_struct.lock().await;
 
         let spread = token_out as i64 - cex.best_ask as i64;
+
+        // Arb check
         if spread > 0 {
             println!(
                 "💸 Arb found: Buy on CEX at {} USDC, Sell on DEX for {} USDC (spread: {})",
@@ -76,7 +81,7 @@ async fn handle_arb_txs(dex_struct: Arc<Mutex<DexStruct>>, cex_struct: Arc<Mutex
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     }
 }
-
+// ------------------- Main -------------------
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
     let dex_struct = Arc::new(Mutex::new(DexStruct {
@@ -92,7 +97,7 @@ async fn main() -> Result<(), anyhow::Error> {
     let cex_clone = cex_struct.clone();
     let dex_grpc_clone = dex_struct.clone();
     let cex_grpc_clone = cex_struct.clone();
-
+    // -------- DEX streaming task --------
     let j1 = tokio::spawn(async move {
         let tls_config = ClientTlsConfig::new().with_native_roots();
         if let Ok(mut client) = GeyserGrpcClient::build_from_shared(
@@ -163,11 +168,11 @@ async fn main() -> Result<(), anyhow::Error> {
             }
         }
     });
-
+    // -------- CEX fetch task --------
     let j2 = tokio::spawn(fetch_cex_data(cex_clone));
-
+    // -------- Arb logic task --------
     let j3 = tokio::spawn(handle_arb_txs(dex_clone, cex_grpc_clone));
-
+    // Wait for all
     j1.await?;
     j2.await?;
     j3.await?;
