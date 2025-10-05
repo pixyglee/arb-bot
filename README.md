@@ -18,3 +18,12 @@ cargo run
 
 ---
 
+## How it works
+
+1. **Listen to the DEX:** Monitor a Solana pool to see how much SOL → USDC you would get.
+2. **Poll the CEX:** Check the latest buy and sell prices from Backpack Exchange.
+3. **Compare prices:** Determine if DEX output is higher than the CEX ask.
+4. **Log opportunity:** If profitable, print “Arb found!” with details.
+5. **Repeat continuously:** Loop forever to catch every opportunity.
+
+---
